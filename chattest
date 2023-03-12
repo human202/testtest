@@ -1,0 +1,165 @@
+import asyncio.exceptions
+import json
+from typing import List
+from fastapi import FastAPI
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import HTMLResponse
+from starlette.staticfiles import StaticFiles
+from settings import settings
+import aiohttp
+from pydantic import BaseModel
+
+app = FastAPI(
+    title="AIChatAPI",
+    description="AIChatAPI is a simple API that uses OpenAI's GPT-3 API to generate responses to messages.",
+    version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=['http://localhost:5173'],
+    allow_credentials=True,
+    allow_methods=["*"],
+)
+
+app.mount('/assets', StaticFiles(directory='assets'), name='assets')
+
+
+class MessageBody(BaseModel):
+    msg: str
+    history: List[List[str]] = []
+    prompt: str = ''
+    token: str = None
+    style: str = '0'
+
+
+index_html = open('templates/index.html', 'r', encoding='utf-8').read()
+
+
+class OpenAIModels:
+    @staticmethod
+    async def check_response(response, message, t='text'):
+        if response.get('error'):
+            return {'code': 500, 'msg': 'error', 'data': response['error']['message']}
+        else:
+            msg = 'success'
+            if t == 'text':
+                data = response['choices'][0]['text']
+                if response['usage']['completion_tokens'] == settings.FREE_TOKENS:
+                    msg = '回复过长，已被截断，如需更长的回复，请购买API_KEY'
+            else:
+                data = response["data"][0]["url"]
+            return {'code': 200, 'msg': msg, 'data': [message.msg, data]}
+
+    async def v1_completions(self, message: MessageBody):
+        messages = []
+        for i in message.history:
+            messages.append({
+                'role': 'assistant',
+                'content': i[0]
+            })
+            messages.append({
+                'role': 'user',
+                'content': i[1]
+            })
+        messages.append(
+            {'role': 'user', 'content': message.msg}
+        )
+        data = {
+            "model": "gpt-3.5-turbo",
+            "messages": messages,
+            "max_tokens": 3072 if message.token else settings.FREE_TOKENS,
+            "temperature": 0.9,
+            "frequency_penalty": 0,
+            "stream": True,
+            "presence_penalty": 0,
+            "stop": ["AI:", "Me:"]
+        }
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(verify_ssl=False)) as session:
+            msg = ''
+            try:
+                async with session.post('https://api.openai.com/v1/chat/completions',
+                                        headers=await settings.headers(message.token),
+                                        json=data) as resp:
+                    async for line in resp.content.iter_any():
+                        lines = line.decode('utf-8').replace('\n', '')
+                        if "error" in lines:
+                            try:
+                                msg = json.loads(lines)['error']['message']
+                            except Exception as e:
+                                msg = 'API KEY错误'
+                            return {'code': 500, 'msg': msg,
+                                    'data': [message.msg, msg]}
+                        for i in lines.split("data: "):
+                            if i:
+                                if "DONE" in i:
+                                    return {'code': 200, 'msg': 'success',
+                                            'data': [message.msg, msg + '（如未显示完全，请填写APIKEY获取完整消息）']}
+                                t = json.loads(i)['choices'][0]
+                                if t.get('delta') and t.get('delta').get('content'):
+                                    msg += t['delta']['content']
+            except asyncio.exceptions.TimeoutError:
+                return {'code': 500, 'msg': '获取超时，请填写API_KEY获取完整消息', 'data': [message.msg, msg]}
+
+    async def image_generations(self, message: MessageBody):
+        data = {"model": "image-alpha-001", "prompt": message.msg, "n": 1, "size": "1024x1024"}
+        if not message.token or settings.FREE_IMAGE_USE:
+            return {'code': 500, 'msg': 'error', 'data': '该功能仅需自备Token使用'}
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(verify_ssl=False),
+                                         timeout=settings.TIME_OUT) as session:
+            try:
+                async with session.post('https://api.openai.com/v1/images/generations',
+                                        headers=settings.headers(message.token), json=data) as resp:
+                    res = await resp.json()
+                    return await self.check_response(res, message, 'url')
+            except asyncio.exceptions.TimeoutError:
+                return {'code': 500, 'msg': '请填写API_KEY获取完整消息',
+                        'data': [message.msg, '请填写API_KEY获取完整消息']}
+
+    async def engines_code_completions(self, message: MessageBody):
+        data = {
+            "prompt": message.msg, "max_tokens": 1000 if message.token else settings.FREE_TOKENS + 10,
+            "temperature": 0.9, "frequency_penalty": 0, "presence_penalty": 0,
+            "best_of": 1, "logprobs": 0, "echo": True,
+        }
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(verify_ssl=False),
+                                         timeout=settings.TIME_OUT) as session:
+            try:
+                async with session.post('https://api.openai.com/v1/engines/code-davinci-002/completions',
+                                        headers=settings.headers(message.token), json=data) as resp:
+                    return await self.check_response(await resp.json(), message)
+            except asyncio.exceptions.TimeoutError:
+                return {'code': 500, 'msg': 'error', 'data': 'OpenAI API Timeout'}
+
+    async def get(self, style, message):
+        return {
+            "0": await self.v1_completions(message),
+            "1": await self.image_generations(message),
+        }.get(style)
+
+
+models = OpenAIModels()
+
+
+@app.get("/")
+async def root():
+    return HTMLResponse(index_html)
+
+
+@app.put('/', description='密码通过看启动日志获取，每次重启都会变,api_key多个请使用英文逗号分隔')
+async def put_root(pwd: str, token: str):
+    if pwd != settings.PASSWORD:
+        return {'code': 403, 'msg': 'wrong password'}
+    settings.API_KEY.extend(token.split(','))
+    return {'code': 200, 'msg': 'ok', 'data': settings.API_KEY}
+
+
+@app.post("/")
+async def root(message: MessageBody):
+    return await models.get(message.style, message)
+
+
+if __name__ == '__main__':
+    import uvicorn
+
+    uvicorn.run('main:app', host='127.0.0.1', port=8000, reload=False)
